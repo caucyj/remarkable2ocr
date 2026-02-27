@@ -1,2 +1,5 @@
 # Development and testing
 pytest>=7.0.0
+scikit-image>=0.22.0
+# Optional: for main.py to render layout.html -> satisfaction/render_*.png
+playwright>=1.40.0

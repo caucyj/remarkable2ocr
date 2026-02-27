@@ -18,10 +18,11 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.config import load_env, get_data_dir
+from src.config import load_env, get_data_dir, get_ocr_api_key
 from src.remarkable import list_notebooks, render_notebook_pages, pull_xochitl
-from src.ocr import ocr_image
+from src.ocr import ocr_image, refine_layout_with_gemini, semantic_layout_with_gemini
 from src.layout import write_ocr_preview_html, render_ocr_overlay, render_ocr_to_html_multi, build_xmind
+from src.layout.render_html_to_png import render_layout_to_satisfaction
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,6 +90,22 @@ def main() -> int:
         default=None,
         help="Process only this project (notebook with matching safe name). Fails with a friendly message if not found and no cache at output/PROJECT_NAME/.",
     )
+    parser.add_argument(
+        "--refine-layout",
+        action="store_true",
+        help="After OCR, call Gemini to refine x_ratio/y_ratio so rendered layout matches the note image (or --refine-to image). Cache: page_N_refined.json or page_N_refined_ref.json",
+    )
+    parser.add_argument(
+        "--refine-to",
+        metavar="IMAGE_PATH",
+        default=None,
+        help="When used with --refine-layout: use this image as the target layout (e.g. output/Testing/satisfaction/expected.png). If omitted, use project satisfaction/expected.png when present.",
+    )
+    parser.add_argument(
+        "--semantic-layout",
+        action="store_true",
+        help="After OCR, call Gemini to understand semantics (flows, hierarchy, grouping) and suggest links + layout. Logs layout suggestion; cache: page_N_semantic.json",
+    )
     args = parser.parse_args()
     use_ocr_cache = not args.no_cache
 
@@ -111,9 +128,9 @@ def main() -> int:
     logger.info("Data dir: %s, output root: %s", data_dir, output_root)
 
     if args.camera is not None:
-        return _run_camera_mode(data_dir, output_root, args.camera, use_ocr_cache, args.xmind)
+        return _run_camera_mode(data_dir, output_root, args.camera, use_ocr_cache, args.xmind, args.refine_layout, args.refine_to, args.semantic_layout)
 
-    return _run_notebook_mode(data_dir, output_root, use_ocr_cache, args.xmind, args.project)
+    return _run_notebook_mode(data_dir, output_root, use_ocr_cache, args.xmind, args.project, args.refine_layout, args.refine_to, args.semantic_layout)
 
 
 def _run_camera_mode(
@@ -122,6 +139,9 @@ def _run_camera_mode(
     project_name: str,
     use_ocr_cache: bool,
     use_xmind: bool = False,
+    refine_layout: bool = False,
+    refine_to: str | None = None,
+    semantic_layout: bool = False,
 ) -> int:
     """Process all images in data/xochitl/camera/<project_name>/."""
     camera_dir = data_dir / "camera" / project_name
@@ -199,9 +219,80 @@ def _run_camera_mode(
     if not all_ocr:
         logger.warning("No OCR result, skipping layout")
         return 0
+    if semantic_layout:
+        api_key = get_ocr_api_key()
+        all_groups: list[list[dict]] = [[] for _ in range(len(all_ocr))]
+        if api_key:
+            for i, (p_path, ocr_lines) in enumerate(zip(page_paths, all_ocr)):
+                if not ocr_lines:
+                    continue
+                cache_semantic = ocr_dir / f"page_{i}_semantic.json"
+                if use_ocr_cache and cache_semantic.is_file():
+                    try:
+                        data = json.loads(cache_semantic.read_text(encoding="utf-8"))
+                        if isinstance(data, list):
+                            all_ocr[i] = data
+                            all_groups[i] = []
+                            logger.info("  Semantic layout page_%d: using cache", i)
+                        elif isinstance(data, dict) and "items" in data:
+                            all_ocr[i] = data["items"]
+                            all_groups[i] = data.get("groups") if isinstance(data.get("groups"), list) else []
+                            logger.info("  Semantic layout page_%d: using cache", i)
+                        else:
+                            raise ValueError("invalid cache")
+                    except Exception:
+                        enriched, suggestion, groups = semantic_layout_with_gemini(p_path, ocr_lines, api_key=api_key)
+                        all_ocr[i] = enriched
+                        all_groups[i] = groups
+                        cache_semantic.write_text(json.dumps({"items": enriched, "groups": groups}, ensure_ascii=False, indent=2), encoding="utf-8")
+                        if suggestion:
+                            logger.info("  Layout suggestion page_%d: %s", i, suggestion)
+                        logger.info("  Semantic layout page_%d: Gemini", i)
+                else:
+                    enriched, suggestion, groups = semantic_layout_with_gemini(p_path, ocr_lines, api_key=api_key)
+                    all_ocr[i] = enriched
+                    all_groups[i] = groups
+                    cache_semantic.write_text(json.dumps({"items": enriched, "groups": groups}, ensure_ascii=False, indent=2), encoding="utf-8")
+                    if suggestion:
+                        logger.info("  Layout suggestion page_%d: %s", i, suggestion)
+                    logger.info("  Semantic layout page_%d: Gemini", i)
+        else:
+            logger.warning("  --semantic-layout skipped: no GOOGLE_API_KEY")
+            all_groups = [[] for _ in range(len(all_ocr))]
+    if refine_layout:
+        api_key = get_ocr_api_key()
+        if api_key:
+            ref_path = Path(refine_to) if refine_to else (out_dir / "satisfaction" / "expected.png")
+            ref_path = ref_path.resolve() if ref_path.is_file() else None
+            cache_suffix = "_ref" if ref_path else ""
+            for i, (p_path, ocr_lines) in enumerate(zip(page_paths, all_ocr)):
+                if not ocr_lines:
+                    continue
+                cache_refined = ocr_dir / f"page_{i}_refined{cache_suffix}.json"
+                if use_ocr_cache and cache_refined.is_file():
+                    try:
+                        all_ocr[i] = json.loads(cache_refined.read_text(encoding="utf-8"))
+                        logger.info("  Layout refinement page_%d: using cache", i)
+                    except Exception:
+                        refined = refine_layout_with_gemini(p_path, ocr_lines, api_key=api_key, reference_image_path=ref_path)
+                        all_ocr[i] = refined
+                        cache_refined.write_text(json.dumps(refined, ensure_ascii=False, indent=2), encoding="utf-8")
+                        logger.info("  Layout refinement page_%d: Gemini", i)
+                else:
+                    refined = refine_layout_with_gemini(p_path, ocr_lines, api_key=api_key, reference_image_path=ref_path)
+                    all_ocr[i] = refined
+                    cache_refined.write_text(json.dumps(refined, ensure_ascii=False, indent=2), encoding="utf-8")
+                    logger.info("  Layout refinement page_%d: Gemini", i)
+        else:
+            logger.warning("  --refine-layout skipped: no GOOGLE_API_KEY")
     try:
-        render_ocr_to_html_multi(all_ocr, out_dir / "layout.html")
+        page_groups = all_groups if semantic_layout else None
+        render_ocr_to_html_multi(all_ocr, out_dir / "layout.html", use_raw_ratios=refine_layout, page_groups=page_groups)
         logger.info("Layout: layout.html (%d page(s))", len(all_ocr))
+        satisfaction_dir = out_dir / "satisfaction"
+        rendered = render_layout_to_satisfaction(out_dir / "layout.html", satisfaction_dir)
+        if rendered:
+            logger.info("Rendered %d page(s) to %s", len(rendered), satisfaction_dir)
     except Exception as e:
         logger.warning("Layout failed: %s", e)
     if use_xmind:
@@ -221,6 +312,9 @@ def _run_notebook_mode(
     use_ocr_cache: bool,
     use_xmind: bool = False,
     project_name_filter: str | None = None,
+    refine_layout: bool = False,
+    refine_to: str | None = None,
+    semantic_layout: bool = False,
 ) -> int:
     """Scan notebooks and process each (or only project_name_filter if set)."""
     notebooks = list_notebooks(data_dir)
@@ -307,9 +401,81 @@ def _run_notebook_mode(
         if not all_ocr:
             logger.warning("  No OCR result, skipping layout")
             continue
+        if semantic_layout:
+            api_key = get_ocr_api_key()
+            all_groups = [[] for _ in range(len(all_ocr))]
+            if api_key:
+                for i, (p_path, ocr_lines) in enumerate(zip(page_paths, all_ocr)):
+                    if not ocr_lines:
+                        continue
+                    cache_semantic = ocr_dir / f"page_{i}_semantic.json"
+                    if use_ocr_cache and cache_semantic.is_file():
+                        try:
+                            data = json.loads(cache_semantic.read_text(encoding="utf-8"))
+                            if isinstance(data, list):
+                                all_ocr[i] = data
+                                all_groups[i] = []
+                                logger.info("  Semantic layout page_%d: using cache", i)
+                            elif isinstance(data, dict) and "items" in data:
+                                all_ocr[i] = data["items"]
+                                all_groups[i] = data.get("groups") if isinstance(data.get("groups"), list) else []
+                                logger.info("  Semantic layout page_%d: using cache", i)
+                            else:
+                                raise ValueError("invalid cache")
+                        except Exception:
+                            enriched, suggestion, groups = semantic_layout_with_gemini(p_path, ocr_lines, api_key=api_key)
+                            all_ocr[i] = enriched
+                            all_groups[i] = groups
+                            cache_semantic.write_text(json.dumps({"items": enriched, "groups": groups}, ensure_ascii=False, indent=2), encoding="utf-8")
+                            if suggestion:
+                                logger.info("  Layout suggestion page_%d: %s", i, suggestion)
+                            logger.info("  Semantic layout page_%d: Gemini", i)
+                    else:
+                        enriched, suggestion, groups = semantic_layout_with_gemini(p_path, ocr_lines, api_key=api_key)
+                        all_ocr[i] = enriched
+                        all_groups[i] = groups
+                        cache_semantic.write_text(json.dumps({"items": enriched, "groups": groups}, ensure_ascii=False, indent=2), encoding="utf-8")
+                        if suggestion:
+                            logger.info("  Layout suggestion page_%d: %s", i, suggestion)
+                        logger.info("  Semantic layout page_%d: Gemini", i)
+            else:
+                logger.warning("  --semantic-layout skipped: no GOOGLE_API_KEY")
+        else:
+            all_groups = [[] for _ in range(len(all_ocr))]
+        if refine_layout:
+            api_key = get_ocr_api_key()
+            if api_key:
+                ref_path = Path(refine_to) if refine_to else (out_dir / "satisfaction" / "expected.png")
+                ref_path = ref_path.resolve() if ref_path.is_file() else None
+                cache_suffix = "_ref" if ref_path else ""
+                for i, (p_path, ocr_lines) in enumerate(zip(page_paths, all_ocr)):
+                    if not ocr_lines:
+                        continue
+                    cache_refined = ocr_dir / f"page_{i}_refined{cache_suffix}.json"
+                    if use_ocr_cache and cache_refined.is_file():
+                        try:
+                            all_ocr[i] = json.loads(cache_refined.read_text(encoding="utf-8"))
+                            logger.info("  Layout refinement page_%d: using cache", i)
+                        except Exception:
+                            refined = refine_layout_with_gemini(p_path, ocr_lines, api_key=api_key, reference_image_path=ref_path)
+                            all_ocr[i] = refined
+                            cache_refined.write_text(json.dumps(refined, ensure_ascii=False, indent=2), encoding="utf-8")
+                            logger.info("  Layout refinement page_%d: Gemini", i)
+                    else:
+                        refined = refine_layout_with_gemini(p_path, ocr_lines, api_key=api_key, reference_image_path=ref_path)
+                        all_ocr[i] = refined
+                        cache_refined.write_text(json.dumps(refined, ensure_ascii=False, indent=2), encoding="utf-8")
+                        logger.info("  Layout refinement page_%d: Gemini", i)
+            else:
+                logger.warning("  --refine-layout skipped: no GOOGLE_API_KEY")
         try:
-            render_ocr_to_html_multi(all_ocr, out_dir / "layout.html")
+            page_groups = all_groups if semantic_layout else None
+            render_ocr_to_html_multi(all_ocr, out_dir / "layout.html", use_raw_ratios=refine_layout, page_groups=page_groups)
             logger.info("  Layout: layout.html (%d pages)", len(all_ocr))
+            satisfaction_dir = out_dir / "satisfaction"
+            rendered = render_layout_to_satisfaction(out_dir / "layout.html", satisfaction_dir)
+            if rendered:
+                logger.info("  Rendered %d page(s) to %s", len(rendered), satisfaction_dir)
         except Exception as e:
             logger.warning("  Layout failed: %s", e)
         if use_xmind:

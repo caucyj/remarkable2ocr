@@ -61,6 +61,7 @@ OCR lines (sorted by y):
         contents.append(types.Part.from_bytes(data=data, mime_type="image/png" if path.suffix.lower() == ".png" else "image/jpeg"))
     contents.append(types.Part.from_text(text=prompt))
 
+    logger.info("Gemini model (semantic chart): %s", model_name)
     logger.info("Semantic parse: calling Gemini API (chart structure)")
     response = client.models.generate_content(
         model=model_name,

@@ -160,11 +160,48 @@ def render_ocr_to_html(
 def _build_one_page_divs(
     ocr_lines: list[dict[str, Any]],
     padding_ratio: float,
+    *,
+    use_raw_ratios: bool = False,
+    page_groups: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    """Build div list for one page; supports shape (box/circle), color, links."""
+    """Build div list for one page; supports shape (box/circle), color, links, optional width/height, and group frames."""
     pad = padding_ratio
-    positions = _normalize_positions(ocr_lines, pad)
+    if use_raw_ratios:
+        positions = [(float(r.get("x_ratio", 0.5)), float(r.get("y_ratio", 0.5))) for r in ocr_lines if (r.get("text") or "").strip()]
+    else:
+        positions = _normalize_positions(ocr_lines, pad)
     divs = []
+    idx = 0
+    index_to_pos: dict[int, tuple[float, float]] = {}
+    for i, row in enumerate(ocr_lines):
+        text = row.get("text", "").strip()
+        if not text:
+            continue
+        if idx >= len(positions):
+            break
+        x_norm, y_norm = positions[idx]
+        index_to_pos[i] = (x_norm, y_norm)
+        idx += 1
+    if page_groups and index_to_pos:
+        frame_margin = 0.02
+        for g in page_groups:
+            indices = g.get("indices") or []
+            pts = [index_to_pos[k] for k in indices if k in index_to_pos]
+            if len(pts) < 2:
+                continue
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            min_x = max(0.0, min(xs) - frame_margin)
+            max_x = min(1.0, max(xs) + frame_margin)
+            min_y = max(0.0, min(ys) - frame_margin)
+            max_y = min(1.0, max(ys) + frame_margin)
+            cx, cy = (min_x + max_x) / 2.0, (min_y + max_y) / 2.0
+            w, h = max_x - min_x, max_y - min_y
+            label = (g.get("label") or "").strip()
+            data_attrs = f' data-group-indices="{",".join(str(k) for k in indices)}"'
+            if label:
+                data_attrs += f' data-group-label="{_esc(label)}"'
+            style = f"left:{_percent(cx)};top:{_percent(cy)};width:{_percent(w)};height:{_percent(h)}"
+            divs.append(f'<div class="ocr-block ocr-frame"{data_attrs} style="{style}" contenteditable="false">{_esc(label)}</div>')
     idx = 0
     for i, row in enumerate(ocr_lines):
         text = row.get("text", "").strip()
@@ -186,18 +223,23 @@ def _build_one_page_divs(
         if color:
             data_attrs += f' data-color="{_esc(color)}"'
         color_style = f" color: {_esc(color)};" if color else ""
+        size_style = ""
+        if row.get("width_ratio") and row.get("height_ratio"):
+            w = max(2, min(100, float(row["width_ratio"]) * 100))
+            h = max(2, min(100, float(row["height_ratio"]) * 100))
+            size_style = f" width: {w:.1f}%; height: {h:.1f}%;"
         content = _esc(text)
         if shape == "box":
             divs.append(
-                f'<div class="ocr-block ocr-shape-box"{data_attrs} style="left:{left};top:{top};{color_style}" contenteditable="false">{content}</div>'
+                f'<div class="ocr-block ocr-shape-box"{data_attrs} style="left:{left};top:{top};{color_style}{size_style}" contenteditable="false">{content}</div>'
             )
         elif shape == "circle":
             divs.append(
-                f'<div class="ocr-block ocr-shape-circle"{data_attrs} style="left:{left};top:{top};{color_style}" contenteditable="false">{content}</div>'
+                f'<div class="ocr-block ocr-shape-circle"{data_attrs} style="left:{left};top:{top};{color_style}{size_style}" contenteditable="false">{content}</div>'
             )
         else:
             divs.append(
-                f'<div class="ocr-line"{data_attrs} style="left:{left};top:{top};{color_style}" contenteditable="false">{content}</div>'
+                f'<div class="ocr-line"{data_attrs} style="left:{left};top:{top};{color_style}{size_style}" contenteditable="false">{content}</div>'
             )
     return divs
 
@@ -207,9 +249,13 @@ def render_ocr_to_html_multi(
     out_path: Path | str,
     *,
     padding_ratio: float = PADDING_RATIO,
+    use_raw_ratios: bool = False,
+    page_groups: list[list[dict[str, Any]]] | None = None,
 ) -> Path:
     """
     Multi-page layout: one section per page, one .ocr-page per section; draggable.
+    When use_raw_ratios is True, x_ratio/y_ratio from OCR are used directly (no normalization) for layout fidelity.
+    page_groups: optional list of per-page groups (each group: { "label": str, "indices": list[int] }) for outer frames.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,7 +264,8 @@ def render_ocr_to_html_multi(
     for page_idx, ocr_lines in enumerate(all_ocr_pages):
         if not ocr_lines:
             continue
-        divs = _build_one_page_divs(ocr_lines, padding_ratio)
+        groups = (page_groups[page_idx] if page_groups and page_idx < len(page_groups) else None) or []
+        divs = _build_one_page_divs(ocr_lines, padding_ratio, use_raw_ratios=use_raw_ratios, page_groups=groups or None)
         if not divs:
             continue
         section_html = f"""<section class="layout-section">
